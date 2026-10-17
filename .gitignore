@@ -61,3 +61,6 @@ crates/docs_preprocessor/actions.json
 
 .local*
 .cache
+
+# A place to store todos.
+todo/

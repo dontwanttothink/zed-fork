@@ -188,6 +188,7 @@ impl VsCodeSettings {
             base_keymap: Some(BaseKeymapContent::VSCode),
             calls: None,
             collaboration_panel: None,
+            context_menu_style: None,
             command_palette: self
                 .read_u64("workbench.commandPalette.history")
                 .map(|history| CommandPaletteSettingsContent {

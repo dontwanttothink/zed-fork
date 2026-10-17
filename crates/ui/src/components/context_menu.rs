@@ -4,10 +4,11 @@ use crate::{
 };
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role,
-    Size, Subscription, TaskExt, anchored, canvas, prelude::*, px, relative,
+    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    PopupMenuItem, Role, Size, Subscription, TaskExt, anchored, canvas, prelude::*, px, relative,
 };
 use menu::{SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious};
+use settings::{ContextMenuStyle, Settings as _};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -226,6 +227,10 @@ pub struct ContextMenu {
     spacing: ListItemSpacing,
     main_menu: Option<Entity<ContextMenu>>,
     main_menu_observed_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The native menu model, built when `context_menu_style` is `native` and
+    /// every item maps onto a native menu item. `None` renders the built-in
+    /// menu.
+    native_menu: Option<Rc<NativeMenu>>,
     // Docs aide-related fields
     documentation_aside: Option<(usize, DocumentationAside)>,
     aside_trigger_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
@@ -359,6 +364,7 @@ impl ContextMenu {
                     spacing: ListItemSpacing::default(),
                     main_menu: None,
                     main_menu_observed_bounds: Rc::new(Cell::new(None)),
+                    native_menu: None,
                     documentation_aside: None,
                     aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                     submenu_state: SubmenuState::Closed,
@@ -430,6 +436,7 @@ impl ContextMenu {
                 spacing: self.spacing,
                 main_menu: None,
                 main_menu_observed_bounds: Rc::new(Cell::new(None)),
+                native_menu: None,
                 documentation_aside: None,
                 aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                 submenu_state: SubmenuState::Closed,
@@ -877,6 +884,28 @@ impl ContextMenu {
         self
     }
 
+    /// The native menu model for this menu, built lazily on the first render
+    /// when `context_menu_style` is `native`. Returns `None` when native menus
+    /// are disabled, unsupported on this platform, or when any item needs the
+    /// built-in menu's custom UI.
+    fn native_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Rc<NativeMenu>> {
+        if self.native_menu.is_none()
+            && ContextMenuStyle::try_get(cx).copied() == Some(ContextMenuStyle::Native)
+            && window.supports_native_context_menus()
+            && !self.keep_open_on_confirm
+            && self.fixed_width.is_none()
+            && self.end_slot_action.is_none()
+        {
+            let model = native_menu_model(&self.items, self.action_context.as_ref(), window, cx);
+            self.native_menu = model.map(Rc::new);
+        }
+        self.native_menu.clone()
+    }
+
     pub fn end_slot_action(mut self, action: Box<dyn Action>) -> Self {
         self.end_slot_action = Some(action);
         self
@@ -1276,6 +1305,7 @@ impl ContextMenu {
                 aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                 main_menu: Some(parent_entity),
                 main_menu_observed_bounds: Rc::new(Cell::new(None)),
+                native_menu: None,
                 submenu_state: SubmenuState::Closed,
                 hover_target: HoverTarget::MainMenu,
                 submenu_safety_threshold_x: None,
@@ -2181,6 +2211,7 @@ impl ContextMenu {
             delayed: false,
             clicked: false,
             end_slot_action: None,
+            native_menu: None,
             key_context: SharedString::from("menu"),
             _on_blur_subscription,
             keep_open_on_confirm: false,
@@ -2215,8 +2246,160 @@ impl ContextMenuItem {
     }
 }
 
+/// A context menu that can be presented with the platform's native menu UI.
+struct NativeMenu {
+    /// Menu items; leaf [`PopupMenuItem::Item`]s without children map 1:1, in
+    /// depth-first order, onto `handlers`.
+    items: Vec<PopupMenuItem>,
+    /// Handlers for the leaf items.
+    handlers: Vec<Rc<dyn Fn(Option<&FocusHandle>, &mut Window, &mut App)>>,
+    /// Whether the native menu has been presented. Guards against scheduling a
+    /// second presentation while tracking; dismissal discards the whole model
+    /// (see `ContextMenu::native_menu`), so a host that reuses this menu's
+    /// entity starts over with a fresh model and presents again on its next
+    /// show.
+    presented: Cell<bool>,
+    /// Set when the platform refuses to present the menu, so the built-in menu
+    /// is rendered instead of nothing. Sticks for the model's lifetime: it is
+    /// safer to keep using the built-in menu than to retry a refused
+    /// presentation every frame.
+    refused: Cell<bool>,
+}
+
+/// Builds a native menu model from `items`, or returns `None` when any item
+/// needs the built-in menu's custom UI. Leaf items — entries without children —
+/// are reported by the platform in depth-first order and map 1:1 onto
+/// `handlers`.
+fn native_menu_model(
+    items: &[ContextMenuItem],
+    action_context: Option<&FocusHandle>,
+    window: &Window,
+    cx: &App,
+) -> Option<NativeMenu> {
+    let mut native_items = Vec::new();
+    let mut handlers = Vec::new();
+    for item in items {
+        match item {
+            ContextMenuItem::Separator => native_items.push(PopupMenuItem::Separator),
+            ContextMenuItem::Header(title) => native_items.push(PopupMenuItem::Label {
+                title: title.clone(),
+                header: true,
+            }),
+            ContextMenuItem::Label(title) => native_items.push(PopupMenuItem::Label {
+                title: title.clone(),
+                header: false,
+            }),
+            ContextMenuItem::Entry(entry) => {
+                if entry.icon.is_some()
+                    || entry.custom_icon_path.is_some()
+                    || entry.custom_icon_svg.is_some()
+                    || entry.documentation_aside.is_some()
+                    || entry.end_slot_icon.is_some()
+                    || entry.end_slot_title.is_some()
+                    || entry.end_slot_handler.is_some()
+                    || entry.show_end_slot_on_hover
+                    || entry.secondary_handler.is_some()
+                {
+                    return None;
+                }
+                let keystrokes = entry
+                    .action
+                    .as_deref()
+                    .and_then(|action| {
+                        let binding = match action_context {
+                            Some(focus) => KeyBinding::for_action_in(action, focus, cx),
+                            None => KeyBinding::for_action(action, cx),
+                        };
+                        binding.resolve_keystrokes(window, cx)
+                    })
+                    .unwrap_or_default();
+                native_items.push(PopupMenuItem::Item {
+                    label: entry.label.clone(),
+                    enabled: !entry.disabled,
+                    checked: entry.toggle.map(|(_, checked)| checked),
+                    keystrokes,
+                    children: Vec::new(),
+                });
+                handlers.push(entry.handler.clone());
+            }
+            ContextMenuItem::HeaderWithLink(..)
+            | ContextMenuItem::CustomEntry { .. }
+            | ContextMenuItem::Submenu { .. } => {
+                // These need custom UI or lazily built submenus, which have no
+                // native equivalent yet.
+                return None;
+            }
+        }
+    }
+    Some(NativeMenu {
+        items: native_items,
+        handlers,
+        presented: Cell::new(false),
+        refused: Cell::new(false),
+    })
+}
+
 impl Render for ContextMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(native) = self.native_menu(window, cx) {
+            if !native.refused.get() {
+                if !native.presented.replace(true) {
+                    let items = native.items.clone();
+                    let handlers = native.handlers.clone();
+                    let action_context = self.action_context.clone();
+                    let weak = cx.weak_entity();
+                    return div().child(canvas(
+                        move |bounds, window, cx| {
+                            let dismissed = weak.clone();
+                            let accepted = window.show_context_menu(
+                                items,
+                                bounds.origin,
+                                cx,
+                                move |selection, window, cx| {
+                                    if let Some(ix) = selection {
+                                        if let Some(handler) = handlers.get(ix) {
+                                            handler(action_context.as_ref(), window, cx);
+                                        }
+                                    }
+                                    if let Err(error) = dismissed.update(cx, |menu, cx| {
+                                        // Discard the model so that a host which reuses
+                                        // this entity (`DropdownMenu`) re-converts and
+                                        // presents again on its next show. Hosts remove
+                                        // the entity from their trees on `DismissEvent`,
+                                        // so a render after this point is a re-show.
+                                        menu.native_menu = None;
+                                        cx.emit(DismissEvent);
+                                    }) {
+                                        log::debug!(
+                                            "native context menu dismissed after teardown: {error}"
+                                        );
+                                    }
+                                },
+                            );
+                            if !accepted {
+                                // The platform refused the menu; render the built-in
+                                // menu instead of nothing. Keep the refused model so
+                                // the converter is not re-run (and refused) forever.
+                                if let Err(error) = weak.update(cx, |menu, cx| {
+                                    if let Some(native) = menu.native_menu.as_ref() {
+                                        native.refused.set(true);
+                                    }
+                                    cx.notify();
+                                }) {
+                                    log::debug!(
+                                        "native context menu fallback skipped after teardown: {error}"
+                                    );
+                                }
+                            }
+                        },
+                        |_, _, _, _| {},
+                    ));
+                }
+                // The native menu is tracking; render nothing until it closes.
+                return div();
+            }
+            // Presentation was refused; fall through to the built-in menu.
+        }
         let theme_settings = theme::theme_settings(cx);
         let ui_font_size = theme_settings.ui_font_size(cx);
         let ui_font_family = theme_settings.ui_font(cx).family.clone();
@@ -2468,6 +2651,83 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
 
     use super::*;
+
+    #[gpui::test]
+    async fn test_native_menu_model(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx
+            .update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    ContextMenu::build(window, cx, |menu, _window, _cx| menu)
+                })
+            })
+            .expect("failed to open window");
+
+        window
+            .update(cx, |_, window, cx| {
+                let items = vec![
+                    ContextMenuItem::Header("Section".into()),
+                    ContextMenuItem::Entry(
+                        ContextMenuEntry::new("Rename").action(Box::new(gpui::NoAction)),
+                    ),
+                    ContextMenuItem::Separator,
+                    ContextMenuItem::Entry(
+                        ContextMenuEntry::new("Hidden").toggleable(IconPosition::Start, true),
+                    ),
+                    ContextMenuItem::Entry(ContextMenuEntry::new("Delete").disabled(true)),
+                ];
+                let model = native_menu_model(&items, None, window, cx)
+                    .expect("items without custom UI should map to a native menu");
+                assert_eq!(model.items.len(), 5);
+                // Leaf entries map onto handlers in order; labels and separators
+                // are not leaves.
+                assert_eq!(model.handlers.len(), 3);
+                let (checked, enabled) = match &model.items[3] {
+                    PopupMenuItem::Item {
+                        checked, enabled, ..
+                    } => (*checked, *enabled),
+                    _ => panic!("expected a menu item"),
+                };
+                assert_eq!(checked, Some(true));
+                assert!(enabled);
+                let enabled = match &model.items[4] {
+                    PopupMenuItem::Item { enabled, .. } => *enabled,
+                    _ => panic!("expected a menu item"),
+                };
+                assert!(!enabled);
+            })
+            .expect("failed to update window");
+
+        window
+            .update(cx, |_, window, cx| {
+                let with_custom_row = vec![ContextMenuItem::CustomEntry {
+                    entry_render: Box::new(|_, _| div().into_any_element()),
+                    handler: Rc::new(|_, _, _| {}),
+                    selectable: true,
+                    documentation_aside: None,
+                }];
+                assert!(native_menu_model(&with_custom_row, None, window, cx).is_none());
+
+                let with_icon = vec![ContextMenuItem::Entry(
+                    ContextMenuEntry::new("Icon").icon(IconName::Check),
+                )];
+                assert!(native_menu_model(&with_icon, None, window, cx).is_none());
+
+                let with_submenu = vec![ContextMenuItem::Submenu {
+                    label: "Ref".into(),
+                    icon: None,
+                    icon_color: None,
+                    builder: Rc::new(|menu, _, _| menu),
+                }];
+                assert!(native_menu_model(&with_submenu, None, window, cx).is_none());
+            })
+            .expect("failed to update window");
+    }
 
     fn focus_menu(menu: &Entity<ContextMenu>, cx: &mut VisualTestContext) {
         cx.update(|window, cx| window.blur(cx));

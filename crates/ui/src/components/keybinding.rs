@@ -188,7 +188,11 @@ impl KeyBinding {
     /// Resolves this keybinding's keystrokes the same way rendering does
     /// (matching the visible accelerator). Returns `None` when there is no
     /// binding.
-    fn resolve_keystrokes(&self, window: &Window, cx: &App) -> Option<Vec<KeybindingKeystroke>> {
+    pub fn resolve_keystrokes(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Vec<KeybindingKeystroke>> {
         let keystrokes = match &self.source {
             Source::Action {
                 action,

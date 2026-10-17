@@ -29,9 +29,10 @@ use gpui::{
     ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
+    PlatformInputHandler, PlatformWindow, Point, PopupMenuItem, PromptButton, PromptLevel,
+    RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams,
+    WindowVisibility, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -56,10 +57,11 @@ use objc2::{
     runtime::{AnyObject as Objc2Object, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSBeep, NSButton as Objc2NSButton, NSDraggingImageComponent,
-    NSDraggingImageComponentIconKey, NSDraggingItem, NSPasteboardWriting, NSTrackingArea,
-    NSTrackingAreaOptions, NSView as Objc2NSView, NSWindow as Objc2NSWindow,
-    NSWindowButton as Objc2NSWindowButton, NSWorkspace,
+    NSAlert, NSAlertStyle, NSBeep, NSButton as Objc2NSButton, NSControlStateValueOff,
+    NSControlStateValueOn, NSDraggingImageComponent, NSDraggingImageComponentIconKey,
+    NSDraggingItem, NSEventModifierFlags as Objc2ModifierFlags, NSMenu, NSMenuItem,
+    NSPasteboardWriting, NSTrackingArea, NSTrackingAreaOptions, NSView as Objc2NSView,
+    NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton, NSWorkspace,
 };
 use objc2_foundation::{NSPoint as Objc2NSPoint, NSRect as Objc2NSRect, NSURL};
 use parking_lot::Mutex;
@@ -136,6 +138,10 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(performKeyEquivalent:),
                 handle_key_equivalent as extern "C" fn(&Object, Sel, id) -> BOOL,
+            );
+            decl.add_method(
+                sel!(handleGPUIContextMenuItem:),
+                handle_context_menu_item as extern "C" fn(&Object, Sel, id),
             );
             decl.add_method(
                 sel!(keyDown:),
@@ -691,6 +697,10 @@ struct MacWindowState {
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
+    // Selection slot for the native context menu currently being presented.
+    // `handleGPUIContextMenuItem:` records the chosen item's leaf index here,
+    // and the presenting block reads it back when menu tracking ends.
+    context_menu_selection: Option<Rc<Cell<Option<usize>>>>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
@@ -1135,6 +1145,7 @@ impl MacWindow {
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
                 do_command_handled: None,
+                context_menu_selection: None,
                 external_files_dragged: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
@@ -1837,6 +1848,55 @@ impl PlatformWindow for MacWindow {
     // is_hovered is unused on macOS. See Window::is_window_hovered.
     fn is_hovered(&self) -> bool {
         false
+    }
+
+    fn supports_native_context_menus(&self) -> bool {
+        true
+    }
+
+    fn show_context_menu(
+        &self,
+        items: Vec<PopupMenuItem>,
+        position: Point<Pixels>,
+        on_done: Box<dyn FnOnce(Option<usize>)>,
+    ) -> bool {
+        let state = self.0.clone();
+        let mtm = self.1;
+        let native_view = state.lock().native_view;
+
+        // The item selector writes the chosen leaf index into this slot; the
+        // presenting block reads it back when menu tracking ends.
+        let selection = Rc::new(Cell::new(None));
+        state.lock().context_menu_selection = Some(selection.clone());
+
+        let Some(view) = (unsafe { Retained::retain(native_view.as_ptr().cast::<Objc2NSView>()) })
+        else {
+            return false;
+        };
+        let mut next_leaf = 0;
+        let menu = build_context_menu(&items, &view, mtm, &mut next_leaf);
+
+        // AppKit places the menu below the given point and flips it to stay on
+        // screen. The content view is not flipped, so convert from GPUI's
+        // top-left origin to view coordinates.
+        let content_height = self.content_size().height;
+        let location = Objc2NSPoint::new(
+            position.x.as_f32() as f64,
+            (content_height - position.y).as_f32() as f64,
+        );
+
+        let context = Box::into_raw(Box::new(ContextMenuPopup {
+            menu,
+            view,
+            location,
+            state,
+            selection,
+            on_done: Some(on_done),
+        }));
+        unsafe {
+            DispatchQueue::main().exec_async_f(context.cast(), present_context_menu);
+        }
+        true
     }
 
     fn set_title(&mut self, title: &str) {
@@ -2568,6 +2628,134 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
 
         let bounds = NSView::bounds(this as *const Object as id);
         let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
+    }
+}
+
+/// Bookkeeping for a native context menu presented outside GPUI's update
+/// cycle. AppKit's menu tracking blocks the presenting block until the menu
+/// closes, after which the outcome is reported through `on_done`.
+struct ContextMenuPopup {
+    menu: Retained<NSMenu>,
+    view: Retained<Objc2NSView>,
+    location: Objc2NSPoint,
+    state: Arc<Mutex<MacWindowState>>,
+    selection: Rc<Cell<Option<usize>>>,
+    on_done: Option<Box<dyn FnOnce(Option<usize>)>>,
+}
+
+extern "C" fn present_context_menu(context: *mut c_void) {
+    let mut context = unsafe { Box::from_raw(context as *mut ContextMenuPopup) };
+    let view: &Objc2NSView = &context.view;
+    context
+        .menu
+        .popUpMenuPositioningItem_atLocation_inView(None, context.location, Some(view));
+    let selection = context.selection.get();
+    {
+        let mut state = context.state.lock();
+        if state
+            .context_menu_selection
+            .as_ref()
+            .is_some_and(|slot| Rc::ptr_eq(slot, &context.selection))
+        {
+            state.context_menu_selection = None;
+        }
+    }
+    if let Some(on_done) = context.on_done.take() {
+        on_done(selection);
+    }
+}
+
+extern "C" fn handle_context_menu_item(this: &Object, _: Sel, item: id) {
+    unsafe {
+        let tag: NSInteger = msg_send![item, tag];
+        let window_state = get_window_state(this);
+        let state = window_state.lock();
+        if let Some(selection) = state.context_menu_selection.as_ref() {
+            selection.set(Some(tag as usize));
+        }
+    }
+}
+
+fn build_context_menu(
+    items: &[PopupMenuItem],
+    target: &Objc2NSView,
+    mtm: MainThreadMarker,
+    next_leaf: &mut usize,
+) -> Retained<NSMenu> {
+    let menu = NSMenu::new(mtm);
+    menu.setAutoenablesItems(false);
+    for item in items {
+        menu.addItem(&build_context_menu_item(item, target, mtm, next_leaf));
+    }
+    menu
+}
+
+fn build_context_menu_item(
+    item: &PopupMenuItem,
+    target: &Objc2NSView,
+    mtm: MainThreadMarker,
+    next_leaf: &mut usize,
+) -> Retained<NSMenuItem> {
+    unsafe {
+        match item {
+            PopupMenuItem::Separator => NSMenuItem::separatorItem(mtm),
+            PopupMenuItem::Label { title, .. } => {
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&objc2_foundation::NSString::from_str(title));
+                item.setEnabled(false);
+                item
+            }
+            PopupMenuItem::Item {
+                label,
+                enabled,
+                checked,
+                keystrokes,
+                children,
+            } => {
+                let is_leaf = children.is_empty();
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&objc2_foundation::NSString::from_str(label));
+                item.setEnabled(*enabled);
+                if let Some(checked) = checked {
+                    item.setState(if *checked {
+                        NSControlStateValueOn
+                    } else {
+                        NSControlStateValueOff
+                    });
+                }
+                if is_leaf {
+                    item.setTag(*next_leaf as _);
+                    *next_leaf += 1;
+                    item.setTarget(Some(target));
+                    item.setAction(Some(objc2::sel!(handleGPUIContextMenuItem:)));
+                } else {
+                    let submenu = build_context_menu(children, target, mtm, next_leaf);
+                    item.setSubmenu(Some(&submenu));
+                }
+                // Platforms can only show single-keystroke accelerators.
+                if let [keystroke] = keystrokes.as_slice() {
+                    item.setKeyEquivalent(&objc2_foundation::NSString::from_str(
+                        crate::events::key_to_native(keystroke.key()).as_ref(),
+                    ));
+                    let modifiers = keystroke.modifiers();
+                    let mut mask = Objc2ModifierFlags::empty();
+                    if modifiers.platform {
+                        mask |= Objc2ModifierFlags::Command;
+                    }
+                    if modifiers.control {
+                        mask |= Objc2ModifierFlags::Control;
+                    }
+                    if modifiers.alt {
+                        mask |= Objc2ModifierFlags::Option;
+                    }
+                    if modifiers.shift {
+                        mask |= Objc2ModifierFlags::Shift;
+                    }
+                    item.setKeyEquivalentModifierMask(mask);
+                }
+                item
+            }
+        }
     }
 }
 

@@ -228,6 +228,18 @@ pub struct SettingsContent {
     /// Configuration for the collab panel visual settings.
     pub collaboration_panel: Option<PanelSettingsContent>,
 
+    /// How to render context menus.
+    ///
+    /// 1. `"custom"`: Render context menus with Zed's UI.
+    /// 2. `"native"`: Use the operating system's native context menus where
+    ///    possible. Menus that need custom UI (custom rows, documentation
+    ///    asides, secondary row buttons, or menus that stay open after an item
+    ///    is chosen) fall back to Zed's built-in context menu. Currently only
+    ///    supported on macOS.
+    ///
+    /// Default: custom
+    pub context_menu_style: Option<ContextMenuStyleContent>,
+
     pub debugger: Option<DebuggerSettingsContent>,
 
     /// Configuration for Diagnostics-related features.
@@ -406,7 +418,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
         call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
-        agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+        agent_servers, audio, auto_update, base_keymap, collaboration_panel, context_menu_style, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
@@ -558,6 +570,20 @@ impl strum::VariantNames for BaseKeymapContent {
         "Cursor",
         "None",
     ];
+}
+
+/// When to use the operating system's native context menus instead of Zed's
+/// built-in context menu.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMenuStyleContent {
+    /// Render context menus with Zed's UI.
+    #[default]
+    Custom,
+    /// Use the operating system's native context menus where possible.
+    Native,
 }
 
 /// Configuration of audio in Zed.

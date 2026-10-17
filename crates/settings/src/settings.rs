@@ -71,6 +71,36 @@ impl Settings for CopilotSettings {
     }
 }
 
+/// When to use the operating system's native context menus instead of Zed's
+/// built-in context menu.
+///
+/// Default: Custom
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, RegisterSetting)]
+pub enum ContextMenuStyle {
+    /// Render context menus with Zed's UI.
+    #[default]
+    Custom,
+    /// Use the operating system's native context menus where possible. Menus
+    /// that need custom UI fall back to Zed's built-in context menu. Currently
+    /// only supported on macOS.
+    Native,
+}
+
+impl From<ContextMenuStyleContent> for ContextMenuStyle {
+    fn from(value: ContextMenuStyleContent) -> Self {
+        match value {
+            ContextMenuStyleContent::Custom => Self::Custom,
+            ContextMenuStyleContent::Native => Self::Native,
+        }
+    }
+}
+
+impl Settings for ContextMenuStyle {
+    fn from_settings(content: &SettingsContent) -> Self {
+        content.context_menu_style.unwrap_or_default().into()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveSettingsProfileName(pub String);
 

@@ -25,6 +25,15 @@
   // 8. "Cursor"
   // 9. "None"
   "base_keymap": "Zed",
+  // How to render context menus:
+  //
+  // 1. "custom": Render context menus with Zed's UI.
+  // 2. "native": Use the operating system's native context menus where
+  //    possible. Menus that need custom UI (custom rows, documentation asides,
+  //    secondary row buttons, or menus that stay open after an item is chosen)
+  //    fall back to Zed's built-in context menu. Currently only supported on
+  //    macOS.
+  "context_menu_style": "custom",
   // The name of a font to use for rendering text in the editor
   // ".ZedMono" currently aliases to Lilex
   // but this may change in the future.

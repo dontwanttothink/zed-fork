@@ -6705,6 +6705,52 @@ impl Window {
         });
     }
 
+    /// Whether this window can display native popup (context) menus via
+    /// [`Window::show_context_menu`].
+    pub fn supports_native_context_menus(&self) -> bool {
+        self.platform_window.supports_native_context_menus()
+    }
+
+    /// Shows a native popup (context) menu at `position` (content coordinates,
+    /// top-left origin).
+    ///
+    /// The flat leaf index of the chosen item is reported to `on_done` — leaves
+    /// are [`crate::PopupMenuItem::Item`]s without children, indexed in
+    /// depth-first order — or `None` if the menu was dismissed. `on_done` runs
+    /// outside of the current update but with access to this window.
+    ///
+    /// Returns `false` when the platform does not support native context menus;
+    /// `on_done` is never called in that case, and callers should fall back to
+    /// their own menu UI.
+    pub fn show_context_menu(
+        &mut self,
+        items: Vec<crate::PopupMenuItem>,
+        position: Point<Pixels>,
+        cx: &mut App,
+        on_done: impl FnOnce(Option<usize>, &mut Window, &mut App) + 'static,
+    ) -> bool {
+        self.clear_pending_keystrokes(cx);
+        let window_id = self.handle.window_id();
+        let async_app = cx.to_async();
+        self.platform_window.show_context_menu(
+            items,
+            position,
+            Box::new(move |result| {
+                // The platform invokes this on the main thread outside of any
+                // GPUI update, so it is safe to borrow the app here.
+                if let Some(app) = async_app.app.upgrade() {
+                    let mut app = app.borrow_mut();
+                    let cx = &mut *app;
+                    if let Err(error) =
+                        cx.update_window_id(window_id, |_, window, cx| on_done(result, window, cx))
+                    {
+                        log::error!("failed to complete native context menu interaction: {error}");
+                    }
+                }
+            }),
+        )
+    }
+
     /// Present a platform dialog.
     /// The provided message will be presented, along with buttons for each answer.
     /// When a button is clicked, the returned Receiver will receive the index of the clicked button.
