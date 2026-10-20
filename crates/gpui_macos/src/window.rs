@@ -25,14 +25,15 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PopupMenuItem, PromptButton, PromptLevel,
-    RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams,
-    WindowVisibility, point, px, size,
+    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ContextMenuItem, ContextMenuItemHandler,
+    ContextMenuItemHandlerRunner, ContextMenuNotSupportedError, ContextMenuOptions,
+    ContextMenuOutcome, CursorStyle, ExternalDragPayload, ExternalPaths, FileDropEvent,
+    ForegroundExecutor, FrameRequestSource, KeyContext, KeyDownEvent, Keymap, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size,
+    SystemWindowTab, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowKind, WindowParams, WindowVisibility, point, popup::PopupAnchor, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -44,6 +45,7 @@ use core_graphics::display::{CGDirectDisplayID, CGRect};
 use ctor::ctor;
 use futures::channel::oneshot;
 use gpui_util::ResultExt;
+use itertools::Itertools;
 use objc::{
     class,
     declare::ClassDecl,
@@ -697,10 +699,10 @@ struct MacWindowState {
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
-    // Selection slot for the native context menu currently being presented.
-    // `handleGPUIContextMenuItem:` records the chosen item's leaf index here,
-    // and the presenting block reads it back when menu tracking ends.
-    context_menu_selection: Option<Rc<Cell<Option<usize>>>>,
+    // Invocation state for the native context menu this window is presenting.
+    // `handleGPUIContextMenuItem:` looks the picked row's behavior up in its
+    // payload table and marks `did_select`.
+    context_menu: Option<Rc<ContextMenuInvocation>>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
@@ -1145,7 +1147,7 @@ impl MacWindow {
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
                 do_command_handled: None,
-                context_menu_selection: None,
+                context_menu: None,
                 external_files_dragged: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
@@ -1856,25 +1858,49 @@ impl PlatformWindow for MacWindow {
 
     fn show_context_menu(
         &self,
-        items: Vec<PopupMenuItem>,
-        position: Point<Pixels>,
-        on_done: Box<dyn FnOnce(Option<usize>)>,
-    ) -> bool {
+        items: Vec<ContextMenuItem>,
+        keymap: &Keymap,
+        options: ContextMenuOptions,
+        run_handler: ContextMenuItemHandlerRunner,
+    ) -> Result<oneshot::Receiver<ContextMenuOutcome>, ContextMenuNotSupportedError> {
         let state = self.0.clone();
         let mtm = self.1;
         let native_view = state.lock().native_view;
 
-        // The item selector writes the chosen leaf index into this slot; the
-        // presenting block reads it back when menu tracking ends.
-        let selection = Rc::new(Cell::new(None));
-        state.lock().context_menu_selection = Some(selection.clone());
-
         let Some(view) = (unsafe { Retained::retain(native_view.as_ptr().cast::<Objc2NSView>()) })
         else {
-            return false;
+            return Err(ContextMenuNotSupportedError);
         };
-        let mut next_leaf = 0;
-        let menu = build_context_menu(&items, &view, mtm, &mut next_leaf);
+
+        // The payload table and the native tree are built together: each pickable
+        // row's `NSMenuItem.tag` indexes `payloads` (the menu bar's `menu_actions`
+        // trick, scoped to this invocation so handlers die with the menu).
+        let mut payloads = Vec::new();
+        let menu = build_context_menu(&items, keymap, &view, mtm, &mut payloads);
+        let invocation = Rc::new(ContextMenuInvocation {
+            payloads,
+            run_handler,
+            did_select: Cell::new(false),
+        });
+        state.lock().context_menu = Some(invocation.clone());
+
+        // Anchor the menu to the requested point of `anchor_rect`.
+        let rect = options.anchor_rect;
+        let (anchor_x, anchor_y) = match options.anchor {
+            PopupAnchor::Center => (rect.size.width / 2., rect.size.height / 2.),
+            PopupAnchor::Top => (rect.size.width / 2., px(0.)),
+            PopupAnchor::Bottom => (rect.size.width / 2., rect.size.height),
+            PopupAnchor::Left => (px(0.), rect.size.height / 2.),
+            PopupAnchor::Right => (rect.size.width, rect.size.height / 2.),
+            PopupAnchor::TopLeft => (px(0.), px(0.)),
+            PopupAnchor::BottomLeft => (px(0.), rect.size.height),
+            PopupAnchor::TopRight => (rect.size.width, px(0.)),
+            PopupAnchor::BottomRight => (rect.size.width, rect.size.height),
+        };
+        let position = point(
+            rect.origin.x + anchor_x + options.offset.x,
+            rect.origin.y + anchor_y + options.offset.y,
+        );
 
         // AppKit places the menu below the given point and flips it to stay on
         // screen. The content view is not flipped, so convert from GPUI's
@@ -1885,18 +1911,25 @@ impl PlatformWindow for MacWindow {
             (content_height - position.y).as_f32() as f64,
         );
 
+        let (sender, receiver) = oneshot::channel();
         let context = Box::into_raw(Box::new(ContextMenuPopup {
             menu,
             view,
             location,
             state,
-            selection,
-            on_done: Some(on_done),
+            invocation,
+            on_done: Some(Box::new(move |outcome| {
+                if sender.send(outcome).is_err() {
+                    // The receiver was dropped before the menu closed.
+                }
+            })),
         }));
+        // Present outside this frame: menu tracking runs a nested run loop that
+        // blocks the presented block until the menu closes.
         unsafe {
             DispatchQueue::main().exec_async_f(context.cast(), present_context_menu);
         }
-        true
+        Ok(receiver)
     }
 
     fn set_title(&mut self, title: &str) {
@@ -2631,6 +2664,15 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
     }
 }
 
+/// Per-invocation state for the native context menu this window is presenting.
+/// Pickable rows' behaviors live in `payloads` in depth-first order;
+/// `handleGPUIContextMenuItem:` looks them up by `NSMenuItem.tag`.
+struct ContextMenuInvocation {
+    payloads: Vec<ContextMenuItemHandler>,
+    run_handler: ContextMenuItemHandlerRunner,
+    did_select: Cell<bool>,
+}
+
 /// Bookkeeping for a native context menu presented outside GPUI's update
 /// cycle. AppKit's menu tracking blocks the presenting block until the menu
 /// closes, after which the outcome is reported through `on_done`.
@@ -2639,8 +2681,8 @@ struct ContextMenuPopup {
     view: Retained<Objc2NSView>,
     location: Objc2NSPoint,
     state: Arc<Mutex<MacWindowState>>,
-    selection: Rc<Cell<Option<usize>>>,
-    on_done: Option<Box<dyn FnOnce(Option<usize>)>>,
+    invocation: Rc<ContextMenuInvocation>,
+    on_done: Option<Box<dyn FnOnce(ContextMenuOutcome)>>,
 }
 
 extern "C" fn present_context_menu(context: *mut c_void) {
@@ -2649,109 +2691,182 @@ extern "C" fn present_context_menu(context: *mut c_void) {
     context
         .menu
         .popUpMenuPositioningItem_atLocation_inView(None, context.location, Some(view));
-    let selection = context.selection.get();
+    let outcome = if context.invocation.did_select.get() {
+        ContextMenuOutcome::Selected
+    } else {
+        ContextMenuOutcome::Dismissed
+    };
     {
         let mut state = context.state.lock();
         if state
-            .context_menu_selection
+            .context_menu
             .as_ref()
-            .is_some_and(|slot| Rc::ptr_eq(slot, &context.selection))
+            .is_some_and(|invocation| Rc::ptr_eq(invocation, &context.invocation))
         {
-            state.context_menu_selection = None;
+            state.context_menu = None;
         }
     }
     if let Some(on_done) = context.on_done.take() {
-        on_done(selection);
+        on_done(outcome);
     }
 }
 
 extern "C" fn handle_context_menu_item(this: &Object, _: Sel, item: id) {
-    unsafe {
+    let tag = unsafe {
         let tag: NSInteger = msg_send![item, tag];
-        let window_state = get_window_state(this);
+        tag as usize
+    };
+    // Look the payload up and release the lock before running it: the handler
+    // updates GPUI state that may re-enter window bookkeeping.
+    let picked = {
+        let window_state = unsafe { get_window_state(this) };
         let state = window_state.lock();
-        if let Some(selection) = state.context_menu_selection.as_ref() {
-            selection.set(Some(tag as usize));
-        }
+        let Some(invocation) = state.context_menu.as_ref() else {
+            return;
+        };
+        invocation.did_select.set(true);
+        invocation
+            .payloads
+            .get(tag)
+            .cloned()
+            .map(|handler| (invocation.run_handler.clone(), handler))
+    };
+    if let Some((run_handler, handler)) = picked {
+        run_handler(handler);
     }
 }
 
 fn build_context_menu(
-    items: &[PopupMenuItem],
+    items: &[ContextMenuItem],
+    keymap: &Keymap,
     target: &Objc2NSView,
     mtm: MainThreadMarker,
-    next_leaf: &mut usize,
+    payloads: &mut Vec<ContextMenuItemHandler>,
 ) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
     for item in items {
-        menu.addItem(&build_context_menu_item(item, target, mtm, next_leaf));
+        menu.addItem(&build_context_menu_item(
+            item, keymap, target, mtm, payloads,
+        ));
     }
     menu
 }
 
 fn build_context_menu_item(
-    item: &PopupMenuItem,
+    item: &ContextMenuItem,
+    keymap: &Keymap,
     target: &Objc2NSView,
     mtm: MainThreadMarker,
-    next_leaf: &mut usize,
+    payloads: &mut Vec<ContextMenuItemHandler>,
 ) -> Retained<NSMenuItem> {
     unsafe {
         match item {
-            PopupMenuItem::Separator => NSMenuItem::separatorItem(mtm),
-            PopupMenuItem::Label { title, .. } => {
+            ContextMenuItem::Separator => NSMenuItem::separatorItem(mtm),
+            ContextMenuItem::Label { title, .. } => {
                 let item = NSMenuItem::new(mtm);
                 item.setTitle(&objc2_foundation::NSString::from_str(title));
                 item.setEnabled(false);
                 item
             }
-            PopupMenuItem::Item {
-                label,
-                enabled,
-                checked,
-                keystrokes,
-                children,
-            } => {
-                let is_leaf = children.is_empty();
+            ContextMenuItem::SystemMenu(os_menu) => {
+                // As in `MacPlatform::create_menu_item`: system-managed submenus
+                // (e.g. Services) are a bare submenu the OS fills in.
                 let item = NSMenuItem::new(mtm);
-                item.setTitle(&objc2_foundation::NSString::from_str(label));
-                item.setEnabled(*enabled);
-                if let Some(checked) = checked {
-                    item.setState(if *checked {
-                        NSControlStateValueOn
-                    } else {
-                        NSControlStateValueOff
-                    });
-                }
-                if is_leaf {
-                    item.setTag(*next_leaf as _);
-                    *next_leaf += 1;
-                    item.setTarget(Some(target));
-                    item.setAction(Some(objc2::sel!(handleGPUIContextMenuItem:)));
+                item.setTitle(&objc2_foundation::NSString::from_str(&os_menu.name));
+                item.setSubmenu(Some(&NSMenu::new(mtm)));
+                item
+            }
+            ContextMenuItem::Submenu { name, items } => {
+                let submenu = build_context_menu(items, keymap, target, mtm, payloads);
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&objc2_foundation::NSString::from_str(name));
+                item.setSubmenu(Some(&submenu));
+                item
+            }
+            ContextMenuItem::Item {
+                name,
+                action,
+                handler,
+                checked,
+                disabled,
+                ..
+            } => {
+                // Action-only rows dispatch their action through the same runner;
+                // rows with neither are inert placeholders.
+                let payload: ContextMenuItemHandler = match handler {
+                    Some(handler) => handler.clone(),
+                    None => match action {
+                        Some(action) => {
+                            let action = action.boxed_clone();
+                            Rc::new(move |_, cx| cx.dispatch_action(action.as_ref()))
+                        }
+                        None => Rc::new(|_, _| {}),
+                    },
+                };
+                let row = payloads.len();
+                payloads.push(payload);
+
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&objc2_foundation::NSString::from_str(name));
+                item.setEnabled(!*disabled);
+                item.setState(if *checked {
+                    NSControlStateValueOn
                 } else {
-                    let submenu = build_context_menu(children, target, mtm, next_leaf);
-                    item.setSubmenu(Some(&submenu));
-                }
-                // Platforms can only show single-keystroke accelerators.
-                if let [keystroke] = keystrokes.as_slice() {
-                    item.setKeyEquivalent(&objc2_foundation::NSString::from_str(
-                        crate::events::key_to_native(keystroke.key()).as_ref(),
-                    ));
-                    let modifiers = keystroke.modifiers();
-                    let mut mask = Objc2ModifierFlags::empty();
-                    if modifiers.platform {
-                        mask |= Objc2ModifierFlags::Command;
+                    NSControlStateValueOff
+                });
+                item.setTag(row as _);
+                item.setTarget(Some(target));
+                item.setAction(Some(objc2::sel!(handleGPUIContextMenuItem:)));
+
+                // Shortcut glyphs resolve from the keymap. The display policy
+                // matches `MacPlatform::create_menu_item`: prefer the earliest
+                // binding matching a default Workspace/Pane/Editor context,
+                // rather than the usual last-binding-wins. See
+                // https://github.com/zed-industries/zed/issues/23621.
+                if let Some(action) = action.as_deref() {
+                    let mut workspace_context = KeyContext::new_with_defaults();
+                    workspace_context.add("Workspace");
+                    let mut pane_context = KeyContext::new_with_defaults();
+                    pane_context.add("Pane");
+                    let mut editor_context = KeyContext::new_with_defaults();
+                    editor_context.add("Editor");
+                    pane_context.extend(&editor_context);
+                    workspace_context.extend(&pane_context);
+                    let key_contexts = vec![workspace_context];
+
+                    let keystrokes = keymap
+                        .bindings_for_action(action)
+                        .find_or_first(|binding| {
+                            binding
+                                .predicate()
+                                .is_none_or(|predicate| predicate.eval(&key_contexts))
+                        })
+                        .map(|binding| binding.keystrokes());
+                    // Platforms can only show single-keystroke accelerators.
+                    if let Some(keystrokes) = keystrokes
+                        && keystrokes.len() == 1
+                    {
+                        let keystroke = &keystrokes[0];
+                        item.setKeyEquivalent(&objc2_foundation::NSString::from_str(
+                            crate::events::key_to_native(keystroke.key()).as_ref(),
+                        ));
+                        let modifiers = keystroke.modifiers();
+                        let mut mask = Objc2ModifierFlags::empty();
+                        if modifiers.platform {
+                            mask |= Objc2ModifierFlags::Command;
+                        }
+                        if modifiers.control {
+                            mask |= Objc2ModifierFlags::Control;
+                        }
+                        if modifiers.alt {
+                            mask |= Objc2ModifierFlags::Option;
+                        }
+                        if modifiers.shift {
+                            mask |= Objc2ModifierFlags::Shift;
+                        }
+                        item.setKeyEquivalentModifierMask(mask);
                     }
-                    if modifiers.control {
-                        mask |= Objc2ModifierFlags::Control;
-                    }
-                    if modifiers.alt {
-                        mask |= Objc2ModifierFlags::Option;
-                    }
-                    if modifiers.shift {
-                        mask |= Objc2ModifierFlags::Shift;
-                    }
-                    item.setKeyEquivalentModifierMask(mask);
                 }
                 item
             }

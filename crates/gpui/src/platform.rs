@@ -1,4 +1,5 @@
 mod app_menu;
+mod context_menu;
 mod keyboard;
 mod keystroke;
 
@@ -44,6 +45,7 @@ use crate::{
     ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
     hash, point, px, size,
 };
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
 use anyhow::{Context as _, Result};
@@ -79,6 +81,7 @@ use strum::EnumIter;
 use uuid::Uuid;
 
 pub use app_menu::*;
+pub use context_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
@@ -1306,28 +1309,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
     fn show_character_palette(&self) {}
-    /// Whether this window can display native popup (context) menus via
-    /// [`PlatformWindow::show_context_menu`].
+    /// Whether [`Self::show_context_menu`] can present native context menus.
     fn supports_native_context_menus(&self) -> bool {
         false
     }
-    /// Shows a native popup (context) menu at `position` (content coordinates,
-    /// top-left origin). Leaf items — [`PopupMenuItem::Item`]s without children
-    /// — are indexed in depth-first order. `on_done` runs exactly once on the
-    /// main thread with the index of the chosen leaf, or `None` if the menu was
-    /// dismissed.
-    ///
-    /// Menu tracking is typically modal: `on_done` runs outside of GPUI's
-    /// update cycle, and at most one menu should be presented at a time.
-    /// Returns `false` when native context menus are not supported, in which
-    /// case `on_done` is never called.
     fn show_context_menu(
         &self,
-        _items: Vec<PopupMenuItem>,
-        _position: Point<Pixels>,
-        _on_done: Box<dyn FnOnce(Option<usize>)>,
-    ) -> bool {
-        false
+        _items: Vec<ContextMenuItem>,
+        _keymap: &Keymap,
+        _options: ContextMenuOptions,
+        _run_handler: ContextMenuItemHandlerRunner,
+    ) -> Result<oneshot::Receiver<ContextMenuOutcome>, ContextMenuNotSupportedError> {
+        Err(ContextMenuNotSupportedError)
     }
     fn titlebar_double_click(&self, _is_resizable: bool, _is_minimizable: bool) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}

@@ -7,22 +7,24 @@ use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    Capslock, Context, ContextMenuItem, ContextMenuItemHandler, ContextMenuItemHandlerRunner,
+    ContextMenuNotSupportedError, ContextMenuOptions, ContextMenuOutcome, Corners, CursorHideMode,
+    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
+    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
+    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -6705,50 +6707,48 @@ impl Window {
         });
     }
 
-    /// Whether this window can display native popup (context) menus via
-    /// [`Window::show_context_menu`].
+    /// Whether this window can show platform-native context menus.
     pub fn supports_native_context_menus(&self) -> bool {
         self.platform_window.supports_native_context_menus()
     }
 
-    /// Shows a native popup (context) menu at `position` (content coordinates,
-    /// top-left origin).
+    /// Show a platform-native context menu anchored to a rectangle in this window.
     ///
-    /// The flat leaf index of the chosen item is reported to `on_done` — leaves
-    /// are [`crate::PopupMenuItem::Item`]s without children, indexed in
-    /// depth-first order — or `None` if the menu was dismissed. `on_done` runs
-    /// outside of the current update but with access to this window.
+    /// A picked row runs its handler if it has one, or dispatches its action
+    /// otherwise, before the returned receiver resolves. The receiver completes
+    /// exactly once: [`ContextMenuOutcome::Selected`] after a pick or
+    /// [`ContextMenuOutcome::Dismissed`] when the menu closes without one.
     ///
-    /// Returns `false` when the platform does not support native context menus;
-    /// `on_done` is never called in that case, and callers should fall back to
-    /// their own menu UI.
+    /// Platforms without native context menus return
+    /// [`ContextMenuNotSupportedError`]; callers should fall back to in-window
+    /// rendering of the same items.
     pub fn show_context_menu(
         &mut self,
-        items: Vec<crate::PopupMenuItem>,
-        position: Point<Pixels>,
+        items: Vec<ContextMenuItem>,
+        options: ContextMenuOptions,
         cx: &mut App,
-        on_done: impl FnOnce(Option<usize>, &mut Window, &mut App) + 'static,
-    ) -> bool {
+    ) -> Result<oneshot::Receiver<ContextMenuOutcome>, ContextMenuNotSupportedError> {
         self.clear_pending_keystrokes(cx);
-        let window_id = self.handle.window_id();
-        let async_app = cx.to_async();
-        self.platform_window.show_context_menu(
-            items,
-            position,
-            Box::new(move |result| {
-                // The platform invokes this on the main thread outside of any
-                // GPUI update, so it is safe to borrow the app here.
-                if let Some(app) = async_app.app.upgrade() {
-                    let mut app = app.borrow_mut();
-                    let cx = &mut *app;
-                    if let Err(error) =
-                        cx.update_window_id(window_id, |_, window, cx| on_done(result, window, cx))
-                    {
-                        log::error!("failed to complete native context menu interaction: {error}");
-                    }
+        // Picks arrive on native callbacks that have no `&mut App`, so hand the
+        // platform a runner carrying the app and window handles.
+        let run_handler: ContextMenuItemHandlerRunner = {
+            let app = cx.to_async();
+            let window_handle = self.handle;
+            Rc::new(move |handler: ContextMenuItemHandler| {
+                if let Some(app) = app.app.upgrade() {
+                    app.borrow_mut().update(|cx| {
+                        if window_handle
+                            .update(cx, |_view, window, cx| handler(window, cx))
+                            .is_err()
+                        {
+                            // The window closed while the menu was open; drop the handler.
+                        }
+                    });
                 }
-            }),
-        )
+            })
+        };
+        self.platform_window
+            .show_context_menu(items, &cx.keymap.borrow(), options, run_handler)
     }
 
     /// Present a platform dialog.

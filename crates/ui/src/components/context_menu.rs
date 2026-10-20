@@ -3,9 +3,10 @@ use crate::{
     ListSeparator, ListSubHeader, Tooltip, prelude::*, utils::WithRemSize,
 };
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    PopupMenuItem, Role, Size, Subscription, TaskExt, anchored, canvas, prelude::*, px, relative,
+    Action, Anchor, AnyElement, App, Bounds, ContextMenuItem as NativeContextMenuItem,
+    ContextMenuOptions, ContextMenuOutcome, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role,
+    Size, Subscription, TaskExt, anchored, canvas, popup::PopupAnchor, prelude::*, px, relative,
 };
 use menu::{SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious};
 use settings::{ContextMenuStyle, Settings as _};
@@ -46,6 +47,7 @@ enum HoverTarget {
     Submenu,
 }
 
+/// An element in a context menu, such as a separator or a selectable option.
 pub enum ContextMenuItem {
     Separator,
     Header(SharedString),
@@ -82,6 +84,7 @@ impl ContextMenuItem {
     }
 }
 
+/// An option in a context menu.
 pub struct ContextMenuEntry {
     toggle: Option<(IconPosition, bool)>,
     label: SharedString,
@@ -900,7 +903,7 @@ impl ContextMenu {
             && self.fixed_width.is_none()
             && self.end_slot_action.is_none()
         {
-            let model = native_menu_model(&self.items, self.action_context.as_ref(), window, cx);
+            let model = native_menu_model(&self.items, self.action_context.as_ref());
             self.native_menu = model.map(Rc::new);
         }
         self.native_menu.clone()
@@ -2248,11 +2251,8 @@ impl ContextMenuItem {
 
 /// A context menu that can be presented with the platform's native menu UI.
 struct NativeMenu {
-    /// Menu items; leaf [`PopupMenuItem::Item`]s without children map 1:1, in
-    /// depth-first order, onto `handlers`.
-    items: Vec<PopupMenuItem>,
-    /// Handlers for the leaf items.
-    handlers: Vec<Rc<dyn Fn(Option<&FocusHandle>, &mut Window, &mut App)>>,
+    /// Menu items; pickable rows carry their own handlers.
+    items: Vec<NativeContextMenuItem>,
     /// Whether the native menu has been presented. Guards against scheduling a
     /// second presentation while tracking; dismissal discards the whole model
     /// (see `ContextMenu::native_menu`), so a host that reuses this menu's
@@ -2267,25 +2267,21 @@ struct NativeMenu {
 }
 
 /// Builds a native menu model from `items`, or returns `None` when any item
-/// needs the built-in menu's custom UI. Leaf items — entries without children —
-/// are reported by the platform in depth-first order and map 1:1 onto
-/// `handlers`.
+/// needs the built-in menu's custom UI. Pickable rows carry their handlers with
+/// them; the platform runs one when its row is chosen.
 fn native_menu_model(
     items: &[ContextMenuItem],
     action_context: Option<&FocusHandle>,
-    window: &Window,
-    cx: &App,
 ) -> Option<NativeMenu> {
     let mut native_items = Vec::new();
-    let mut handlers = Vec::new();
     for item in items {
         match item {
-            ContextMenuItem::Separator => native_items.push(PopupMenuItem::Separator),
-            ContextMenuItem::Header(title) => native_items.push(PopupMenuItem::Label {
+            ContextMenuItem::Separator => native_items.push(NativeContextMenuItem::Separator),
+            ContextMenuItem::Header(title) => native_items.push(NativeContextMenuItem::Label {
                 title: title.clone(),
                 header: true,
             }),
-            ContextMenuItem::Label(title) => native_items.push(PopupMenuItem::Label {
+            ContextMenuItem::Label(title) => native_items.push(NativeContextMenuItem::Label {
                 title: title.clone(),
                 header: false,
             }),
@@ -2302,25 +2298,18 @@ fn native_menu_model(
                 {
                     return None;
                 }
-                let keystrokes = entry
-                    .action
-                    .as_deref()
-                    .and_then(|action| {
-                        let binding = match action_context {
-                            Some(focus) => KeyBinding::for_action_in(action, focus, cx),
-                            None => KeyBinding::for_action(action, cx),
-                        };
-                        binding.resolve_keystrokes(window, cx)
-                    })
-                    .unwrap_or_default();
-                native_items.push(PopupMenuItem::Item {
-                    label: entry.label.clone(),
-                    enabled: !entry.disabled,
-                    checked: entry.toggle.map(|(_, checked)| checked),
-                    keystrokes,
-                    children: Vec::new(),
+                let context = action_context.cloned();
+                let handler = entry.handler.clone();
+                native_items.push(NativeContextMenuItem::Item {
+                    name: entry.label.clone(),
+                    action: entry.action.as_ref().map(|action| action.boxed_clone()),
+                    handler: Some(Rc::new(move |window, cx| {
+                        handler(context.as_ref(), window, cx)
+                    })),
+                    os_action: None,
+                    checked: entry.toggle.map_or(false, |(_, checked)| checked),
+                    disabled: entry.disabled,
                 });
-                handlers.push(entry.handler.clone());
             }
             ContextMenuItem::HeaderWithLink(..)
             | ContextMenuItem::CustomEntry { .. }
@@ -2333,7 +2322,6 @@ fn native_menu_model(
     }
     Some(NativeMenu {
         items: native_items,
-        handlers,
         presented: Cell::new(false),
         refused: Cell::new(false),
     })
@@ -2345,50 +2333,56 @@ impl Render for ContextMenu {
             if !native.refused.get() {
                 if !native.presented.replace(true) {
                     let items = native.items.clone();
-                    let handlers = native.handlers.clone();
-                    let action_context = self.action_context.clone();
                     let weak = cx.weak_entity();
                     return div().child(canvas(
                         move |bounds, window, cx| {
-                            let dismissed = weak.clone();
-                            let accepted = window.show_context_menu(
-                                items,
-                                bounds.origin,
-                                cx,
-                                move |selection, window, cx| {
-                                    if let Some(ix) = selection {
-                                        if let Some(handler) = handlers.get(ix) {
-                                            handler(action_context.as_ref(), window, cx);
+                            let options = ContextMenuOptions {
+                                // The canvas bounds are the trigger's; anchor at
+                                // its origin.
+                                anchor_rect: Bounds::new(bounds.origin, Size::default()),
+                                anchor: PopupAnchor::TopLeft,
+                                offset: Point::default(),
+                            };
+                            match window.show_context_menu(items, options, cx) {
+                                Ok(receiver) => {
+                                    let dismissed = weak.clone();
+                                    cx.spawn(async move |cx| {
+                                        // Picked and dismissed closes share this
+                                        // bookkeeping; a pick's handler already ran.
+                                        let outcome = receiver
+                                            .await
+                                            .unwrap_or(ContextMenuOutcome::Dismissed);
+                                        log::debug!("native context menu closed: {outcome:?}");
+                                        if let Err(error) = dismissed.update(cx, |menu, cx| {
+                                            // Discard the model so that a host which reuses
+                                            // this entity (`DropdownMenu`) re-converts and
+                                            // presents again on its next show. Hosts remove
+                                            // the entity from their trees on `DismissEvent`,
+                                            // so a render after this point is a re-show.
+                                            menu.native_menu = None;
+                                            cx.emit(DismissEvent);
+                                        }) {
+                                            log::debug!(
+                                                "native context menu dismissed after teardown: {error}"
+                                            );
                                         }
-                                    }
-                                    if let Err(error) = dismissed.update(cx, |menu, cx| {
-                                        // Discard the model so that a host which reuses
-                                        // this entity (`DropdownMenu`) re-converts and
-                                        // presents again on its next show. Hosts remove
-                                        // the entity from their trees on `DismissEvent`,
-                                        // so a render after this point is a re-show.
-                                        menu.native_menu = None;
-                                        cx.emit(DismissEvent);
+                                    })
+                                    .detach();
+                                }
+                                Err(_) => {
+                                    // The platform refused the menu; render the built-in
+                                    // menu instead of nothing. Keep the refused model so
+                                    // the converter is not re-run (and refused) forever.
+                                    if let Err(error) = weak.update(cx, |menu, cx| {
+                                        if let Some(native) = menu.native_menu.as_ref() {
+                                            native.refused.set(true);
+                                        }
+                                        cx.notify();
                                     }) {
                                         log::debug!(
-                                            "native context menu dismissed after teardown: {error}"
+                                            "native context menu fallback skipped after teardown: {error}"
                                         );
                                     }
-                                },
-                            );
-                            if !accepted {
-                                // The platform refused the menu; render the built-in
-                                // menu instead of nothing. Keep the refused model so
-                                // the converter is not re-run (and refused) forever.
-                                if let Err(error) = weak.update(cx, |menu, cx| {
-                                    if let Some(native) = menu.native_menu.as_ref() {
-                                        native.refused.set(true);
-                                    }
-                                    cx.notify();
-                                }) {
-                                    log::debug!(
-                                        "native context menu fallback skipped after teardown: {error}"
-                                    );
                                 }
                             }
                         },
@@ -2669,7 +2663,7 @@ mod tests {
             .expect("failed to open window");
 
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |_, _, _| {
                 let items = vec![
                     ContextMenuItem::Header("Section".into()),
                     ContextMenuItem::Entry(
@@ -2681,42 +2675,54 @@ mod tests {
                     ),
                     ContextMenuItem::Entry(ContextMenuEntry::new("Delete").disabled(true)),
                 ];
-                let model = native_menu_model(&items, None, window, cx)
+                let model = native_menu_model(&items, None)
                     .expect("items without custom UI should map to a native menu");
                 assert_eq!(model.items.len(), 5);
-                // Leaf entries map onto handlers in order; labels and separators
-                // are not leaves.
-                assert_eq!(model.handlers.len(), 3);
-                let (checked, enabled) = match &model.items[3] {
-                    PopupMenuItem::Item {
-                        checked, enabled, ..
-                    } => (*checked, *enabled),
+                // Pickable entries carry their handlers; labels and separators do not.
+                let pickable = model
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item,
+                            NativeContextMenuItem::Item {
+                                handler: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                assert_eq!(pickable, 3);
+                let (checked, disabled) = match &model.items[3] {
+                    NativeContextMenuItem::Item {
+                        checked, disabled, ..
+                    } => (*checked, *disabled),
                     _ => panic!("expected a menu item"),
                 };
-                assert_eq!(checked, Some(true));
-                assert!(enabled);
-                let enabled = match &model.items[4] {
-                    PopupMenuItem::Item { enabled, .. } => *enabled,
+                assert!(checked);
+                assert!(!disabled);
+                let disabled = match &model.items[4] {
+                    NativeContextMenuItem::Item { disabled, .. } => *disabled,
                     _ => panic!("expected a menu item"),
                 };
-                assert!(!enabled);
+                assert!(disabled);
             })
             .expect("failed to update window");
 
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |_, _, _| {
                 let with_custom_row = vec![ContextMenuItem::CustomEntry {
                     entry_render: Box::new(|_, _| div().into_any_element()),
                     handler: Rc::new(|_, _, _| {}),
                     selectable: true,
                     documentation_aside: None,
                 }];
-                assert!(native_menu_model(&with_custom_row, None, window, cx).is_none());
+                assert!(native_menu_model(&with_custom_row, None).is_none());
 
                 let with_icon = vec![ContextMenuItem::Entry(
                     ContextMenuEntry::new("Icon").icon(IconName::Check),
                 )];
-                assert!(native_menu_model(&with_icon, None, window, cx).is_none());
+                assert!(native_menu_model(&with_icon, None).is_none());
 
                 let with_submenu = vec![ContextMenuItem::Submenu {
                     label: "Ref".into(),
@@ -2724,7 +2730,7 @@ mod tests {
                     icon_color: None,
                     builder: Rc::new(|menu, _, _| menu),
                 }];
-                assert!(native_menu_model(&with_submenu, None, window, cx).is_none());
+                assert!(native_menu_model(&with_submenu, None).is_none());
             })
             .expect("failed to update window");
     }

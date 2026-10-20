@@ -1,4 +1,4 @@
-use crate::{Action, App, KeybindingKeystroke, Platform, SharedString};
+use crate::{Action, App, Platform, SharedString};
 
 /// A menu of the application, either a main menu or a submenu
 pub struct Menu {
@@ -47,6 +47,7 @@ impl Menu {
 /// OS menus are menus that are recognized by the operating system
 /// This allows the operating system to provide specialized items for
 /// these menus
+#[derive(Clone)]
 pub struct OsMenu {
     /// The name of the menu
     pub name: SharedString,
@@ -326,49 +327,6 @@ pub enum OsAction {
 
     /// The 'redo' action
     Redo,
-}
-
-/// An item in a native popup (context) menu.
-///
-/// Unlike [`MenuItem`], popup items are not backed by actions: the platform
-/// reports which item was chosen by its flat leaf index (see
-/// [`PlatformWindow::show_context_menu`](crate::PlatformWindow::show_context_menu)),
-/// and the caller runs its own handlers. Items with children are submenus and
-/// are not themselves leaves.
-#[derive(Clone)]
-pub enum PopupMenuItem {
-    /// A separator between items.
-    Separator,
-
-    /// A non-interactive label. When `header` is set, the platform may style it
-    /// as a section header.
-    Label {
-        /// The text of the label.
-        title: SharedString,
-
-        /// Whether this label introduces a section of the menu.
-        header: bool,
-    },
-
-    /// A menu item.
-    Item {
-        /// The text of the item.
-        label: SharedString,
-
-        /// Whether the item can be chosen.
-        enabled: bool,
-
-        /// `Some` for toggleable items: whether the item is checked.
-        checked: Option<bool>,
-
-        /// The keystrokes to display as the item's accelerator. Platforms may
-        /// only show single-keystroke bindings.
-        keystrokes: Vec<KeybindingKeystroke>,
-
-        /// Submenu items. A non-empty list makes this item a submenu header,
-        /// which is not itself selectable.
-        children: Vec<PopupMenuItem>,
-    },
 }
 
 pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &App) {
