@@ -2261,8 +2261,7 @@ struct NativeMenu {
 }
 
 /// Builds a native menu model from `items`, or returns `None` when any item
-/// needs the built-in menu's custom UI. Pickable rows carry their handlers with
-/// them, which the platform runs one when its row is chosen.
+/// needs the built-in menu's custom UI.
 fn native_menu_model(
     items: &[ContextMenuItem],
     action_context: Option<&FocusHandle>,
