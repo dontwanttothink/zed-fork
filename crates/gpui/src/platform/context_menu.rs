@@ -8,27 +8,12 @@ use crate::{
 };
 
 /// A context menu row's behavior, invoked with app and window access when the row is picked.
-///
-/// Unlike [`MenuItem`] actions, handlers may capture per-invocation state, which is
-/// why they exist only on this transient vocabulary: menu bar and Dock menus are
-/// persistent (and, for jump lists, cross-process), so their rows stay action-only.
-/// Handlers are dropped when the menu closes; capture `WeakEntity` handles (or
-/// rebuild on state change) if a host keeps a menu model around for long.
 pub type ContextMenuItemHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Invokes a [`ContextMenuItemHandler`] in app context.
-///
-/// Platform code has no [`App`] access at pick time (the pick arrives on a native
-/// callback), so [`crate::Window::show_context_menu`] supplies this runner instead.
 pub type ContextMenuItemHandlerRunner = Rc<dyn Fn(ContextMenuItemHandler)>;
 
 /// An item in a platform-native context menu.
-///
-/// The vocabulary mirrors [`MenuItem`] (labels, separators, submenus, checked and
-/// disabled rows, system menus) but rows may also carry an arbitrary handler as
-/// their behavior. A row's `action`, when present, remains its identity for
-/// keymap purposes: it resolves the shortcut glyph shown next to the label and is
-/// dispatched on pick when there is no handler.
 pub enum ContextMenuItem {
     /// A separator between items.
     Separator,
@@ -128,11 +113,6 @@ pub enum ContextMenuOutcome {
 }
 
 /// Returned when the current platform has no native context menu implementation.
-///
-/// Native context menus are separate from gpui's in-window popovers, which are
-/// drawn as elements inside an existing window. A caller that wants a menu on
-/// every platform should treat this error as a cue to fall back to that
-/// in-window rendering of the same items.
 #[derive(Debug, Error)]
 #[error("native context menus are not supported on this platform")]
 pub struct ContextMenuNotSupportedError;

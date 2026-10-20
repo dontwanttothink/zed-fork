@@ -2251,24 +2251,18 @@ impl ContextMenuItem {
 
 /// A context menu that can be presented with the platform's native menu UI.
 struct NativeMenu {
-    /// Menu items; pickable rows carry their own handlers.
+    /// Menu items.
     items: Vec<NativeContextMenuItem>,
-    /// Whether the native menu has been presented. Guards against scheduling a
-    /// second presentation while tracking; dismissal discards the whole model
-    /// (see `ContextMenu::native_menu`), so a host that reuses this menu's
-    /// entity starts over with a fresh model and presents again on its next
-    /// show.
+    /// Whether the native menu has been presented.
     presented: Cell<bool>,
     /// Set when the platform refuses to present the menu, so the built-in menu
-    /// is rendered instead of nothing. Sticks for the model's lifetime: it is
-    /// safer to keep using the built-in menu than to retry a refused
-    /// presentation every frame.
+    /// is rendered instead of nothing.
     refused: Cell<bool>,
 }
 
 /// Builds a native menu model from `items`, or returns `None` when any item
 /// needs the built-in menu's custom UI. Pickable rows carry their handlers with
-/// them; the platform runs one when its row is chosen.
+/// them, which the platform runs one when its row is chosen.
 fn native_menu_model(
     items: &[ContextMenuItem],
     action_context: Option<&FocusHandle>,

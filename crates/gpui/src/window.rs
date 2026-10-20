@@ -6715,13 +6715,11 @@ impl Window {
     /// Show a platform-native context menu anchored to a rectangle in this window.
     ///
     /// A picked row runs its handler if it has one, or dispatches its action
-    /// otherwise, before the returned receiver resolves. The receiver completes
-    /// exactly once: [`ContextMenuOutcome::Selected`] after a pick or
-    /// [`ContextMenuOutcome::Dismissed`] when the menu closes without one.
+    /// otherwise, before the returned receiver resolves.
     ///
     /// Platforms without native context menus return
-    /// [`ContextMenuNotSupportedError`]; callers should fall back to in-window
-    /// rendering of the same items.
+    /// [`ContextMenuNotSupportedError`]; callers should fall back to another
+    /// presentation of the same items.
     pub fn show_context_menu(
         &mut self,
         items: Vec<ContextMenuItem>,
@@ -6729,8 +6727,7 @@ impl Window {
         cx: &mut App,
     ) -> Result<oneshot::Receiver<ContextMenuOutcome>, ContextMenuNotSupportedError> {
         self.clear_pending_keystrokes(cx);
-        // Picks arrive on native callbacks that have no `&mut App`, so hand the
-        // platform a runner carrying the app and window handles.
+        // We carry the necessary app and window handles in a closure.
         let run_handler: ContextMenuItemHandlerRunner = {
             let app = cx.to_async();
             let window_handle = self.handle;
