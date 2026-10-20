@@ -2763,11 +2763,18 @@ fn build_context_menu_item(
     unsafe {
         match item {
             ContextMenuItem::Separator => NSMenuItem::separatorItem(mtm),
-            ContextMenuItem::Label { title, .. } => {
-                let item = NSMenuItem::new(mtm);
-                item.setTitle(&objc2_foundation::NSString::from_str(title));
-                item.setEnabled(false);
-                item
+            ContextMenuItem::Label { title, header } => {
+                let title = objc2_foundation::NSString::from_str(title);
+                // `sectionHeaderWithTitle:` doesn't exist before macOS 14. On
+                // older versions, fall back to a disabled item.
+                if *header && is_macos_version_at_least(NSOperatingSystemVersion::new(14, 0, 0)) {
+                    NSMenuItem::sectionHeaderWithTitle(&title, mtm)
+                } else {
+                    let item = NSMenuItem::new(mtm);
+                    item.setTitle(&title);
+                    item.setEnabled(false);
+                    item
+                }
             }
             ContextMenuItem::SystemMenu(os_menu) => {
                 // As in `MacPlatform::create_menu_item`: system-managed submenus
@@ -2819,6 +2826,7 @@ fn build_context_menu_item(
                 item.setTarget(Some(target));
                 item.setAction(Some(objc2::sel!(handleGPUIContextMenuItem:)));
 
+                // TODO: check this
                 // Shortcut glyphs resolve from the keymap. The display policy
                 // matches `MacPlatform::create_menu_item`: prefer the earliest
                 // binding matching a default Workspace/Pane/Editor context,
@@ -2843,7 +2851,7 @@ fn build_context_menu_item(
                                 .is_none_or(|predicate| predicate.eval(&key_contexts))
                         })
                         .map(|binding| binding.keystrokes());
-                    // Platforms can only show single-keystroke accelerators.
+                    // The system only understands single-keystroke key equivalents.
                     if let Some(keystrokes) = keystrokes
                         && keystrokes.len() == 1
                     {
